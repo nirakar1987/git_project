@@ -1,0 +1,173 @@
+---
+- name: Master System Management Playbook
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    # Default variables (can be overridden by extra_vars from the App)
+    cleanup_type: "logs"       # Options: logs, tmp, cache
+    patch_action: "check"      # Options: check, apply
+    software_action: "install" # Options: install, remove
+    package_name: ""           # Required for software_action
+
+  tasks:
+    # =========================================================================
+    # 0. HOST DISCOVERY & CONNECTIVITY
+    # =========================================================================
+    - name: Ping Host
+      ping:
+      tags: ['discovery', 'always']
+
+    # =========================================================================
+    # 1. METRICS COLLECTION (Real-time System Stats)
+    # =========================================================================
+    - name: Gather System Metrics
+      tags: ['metrics']
+      block:
+        # --- CPU Usage ---
+        - name: Get CPU Usage (User + System)
+          shell: |
+            top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}'
+          register: cpu_usage_cmd
+          changed_when: false
+
+        # --- Memory Usage ---
+        - name: Get Memory Usage Percentage
+          shell: |
+            free | grep Mem | awk '{print $3/$2 * 100.0}'
+          register: mem_usage_cmd
+          changed_when: false
+
+        # --- Disk Usage ---
+        - name: Get Root Disk Usage Percentage
+          shell: |
+            df -h / | awk 'NR==2 {print $5}' | sed 's/%//'
+          register: disk_usage_cmd
+          changed_when: false
+
+        # --- Network Traffic (Mocked for simplicity, requires monitoring tools for real data) ---
+        - name: Get Network Traffic
+          set_fact:
+            net_sent: "{{ (ansible_date_time.epoch | int % 100) / 10 }}" # Placeholder
+            net_recv: "{{ (ansible_date_time.epoch | int % 50) / 10 }}"  # Placeholder
+
+        # --- Set Facts for App Consumption ---
+        - name: Set Standardized Metrics Facts
+          set_fact:
+            custom_cpu_percent: "{{ cpu_usage_cmd.stdout | float | round(1) }}"
+            custom_memory_percent: "{{ mem_usage_cmd.stdout | float | round(1) }}"
+            custom_disk_percent: "{{ disk_usage_cmd.stdout | float | round(1) }}"
+            custom_network_sent: "{{ net_sent }}"
+            custom_network_recv: "{{ net_recv }}"
+
+        - name: Display Metrics
+          debug:
+            msg: "CPU: {{ custom_cpu_percent }}%, Mem: {{ custom_memory_percent }}%, Disk: {{ custom_disk_percent }}%"
+
+    # =========================================================================
+    # 2. SYSTEM CLEANUP (Maintenance)
+    # =========================================================================
+    - name: System Cleanup Tasks
+      tags: ['cleanup']
+      block:
+        # --- Clean Logs ---
+        - name: Truncate System Logs (Safe Cleanup)
+          shell: find /var/log -type f -name "*.log" -exec truncate -s 0 {} \;
+          when: cleanup_type == 'logs'
+          register: clean_logs_out
+          ignore_errors: yes
+
+        # --- Clean Temp Files ---
+        - name: Remove Old Temp Files (> 7 days)
+          shell: find /tmp -type f -atime +7 -delete
+          when: cleanup_type == 'tmp'
+          register: clean_tmp_out
+          ignore_errors: yes
+
+        # --- Clean Package Cache (Debian/Ubuntu) ---
+        - name: Clean Apt Cache
+          apt:
+            autoclean: yes
+          when: cleanup_type == 'cache' and ansible_os_family == 'Debian'
+
+        # --- Clean Package Cache (RHEL/CentOS) ---
+        - name: Clean Yum/Dnf Cache
+          shell: yum clean all
+          when: cleanup_type == 'cache' and ansible_os_family == 'RedHat'
+
+        - name: Cleanup Result
+          debug:
+            msg: "Cleanup of {{ cleanup_type }} completed successfully."
+
+    # =========================================================================
+    # 3. PATCHING & UPDATES (OS Patching)
+    # =========================================================================
+    - name: Patching and Updates
+      tags: ['patch']
+      block:
+        # --- CHECK UPDATES (Debian/Ubuntu) ---
+        - name: Check for Updates (Apt)
+          shell: apt list --upgradable 2>/dev/null | grep -v Listing | wc -l
+          register: apt_check
+          when: patch_action == 'check' and ansible_os_family == 'Debian'
+          changed_when: false
+
+        # --- CHECK UPDATES (RHEL/CentOS) ---
+        - name: Check for Updates (Yum)
+          shell: yum check-update --quiet | wc -l
+          register: yum_check
+          when: patch_action == 'check' and ansible_os_family == 'RedHat'
+          changed_when: false
+          failed_when: yum_check.rc != 0 and yum_check.rc != 100
+
+        - name: Report Update Status
+          debug:
+            msg: "{{ apt_check.stdout if ansible_os_family == 'Debian' else yum_check.stdout }} updates available."
+          when: patch_action == 'check'
+
+        # --- APPLY UPDATES (Debian/Ubuntu) ---
+        - name: Apply Updates (Apt)
+          apt:
+            upgrade: dist
+            update_cache: yes
+          when: patch_action == 'apply' and ansible_os_family == 'Debian'
+          register: apt_update
+
+        # --- APPLY UPDATES (RHEL/CentOS) ---
+        - name: Apply Updates (Yum)
+          yum:
+            name: '*'
+            state: latest
+          when: patch_action == 'apply' and ansible_os_family == 'RedHat'
+          register: yum_update
+
+    # =========================================================================
+    # 4. SOFTWARE MANAGEMENT (Install/Remove Packages)
+    # =========================================================================
+    - name: Software Management
+      tags: ['software']
+      block:
+        - name: Validate Package Name
+          fail:
+            msg: "Variable 'package_name' is required for software operations."
+          when: package_name is not defined or package_name == ""
+
+        # --- INSTALL PACKAGE ---
+        - name: Install Package
+          package:
+            name: "{{ package_name }}"
+            state: present
+          when: software_action == 'install'
+          register: install_result
+
+        # --- REMOVE PACKAGE ---
+        - name: Remove Package
+          package:
+            name: "{{ package_name }}"
+            state: absent
+          when: software_action == 'remove'
+          register: remove_result
+
+        - name: Software Action Result
+          debug:
+            msg: "Package '{{ package_name }}' {{ software_action }}ed successfully."
